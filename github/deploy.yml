@@ -1,0 +1,118 @@
+# SSH_PRIVATE_KEY: 服务器上的私钥
+# SERVER_HOST_IP：服务器的 ip
+
+name: Deploy to Server
+on:
+  push:
+    branches:
+      - 'test' # 测试环境分支
+      - 'master' # 生产环境分支
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # 根据分支来决定环境，master分支为生产环境，其他分支为test环境
+    environment: ${{ github.ref == 'refs/heads/master' && 'production' || 'test' }}
+    permissions:
+      contents: write # 允许工作流写入内容（用于部署）
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          # 根据具体情况调整 nodejs 的版本
+          node-version: '22'
+
+      # 将目标服务器的私钥，存到 github 上的仓库变量中
+      # 在 workflow 中动态写入文件
+      - name: Create SSH key
+        run: |
+          mkdir -p ~/.ssh/
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/private.key
+          chmod 600 ~/.ssh/private.key
+
+      # 将目标服务器的 ip，存到 github 上的仓库变量中
+      # 在 workflow 中动态写入文件
+      - name: Add known hosts
+        run: |
+          ssh-keyscan -H ${{ secrets.SERVER_HOST_IP }} >> ~/.ssh/known_hosts
+
+      # 创建.env文件并写入运行时的变量
+      # 将需要的变量写到 github 仓库变量中
+      # 在 workflow 中动态写入 .env 文件
+      # 在启动项目时，读取 .env 文件拿到变量的值
+      # 这样可以避免在代码中保存各环境的配置
+      - name: Create .env file
+        run: |
+          # 确保文件存在并以换行符结尾
+          [ -f .env ] && echo "" >> .env || touch .env
+          echo "PORT=${{ vars.PORT }}" >> .env
+          # 可以根据需要继续添加
+
+      # 可选项，安装包管理器
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      # 安装依赖
+      - name: Install dependencies
+        run: pnpm install
+
+      # 部署至服务器
+      - name: Deploy to Server
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST_IP }}
+          SERVER_USERNAME: ${{ secrets.SERVER_USERNAME }}
+          # 可以使用 ${{ github.ref }} 来区分各环境的 path
+          DEPLOY_PATH: /path/to/your/project
+          # 示例，使用 github.ref 的值，区分正式环境和测试环境
+          NODE_ENV: ${{ github.ref == 'refs/heads/master' && 'production' || 'test' }}
+
+        # 可根据项目需要调整命令
+        run: |
+          # 打包应用
+          NODE_ENV=$NODE_ENV npm run build:server
+
+          # 将应用文件传输到服务器
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/private.key" \
+            --exclude 'node_modules' \
+            --exclude '.git' \
+            --exclude '.github' \
+            ./ $SERVER_USERNAME@$SERVER_HOST:$DEPLOY_PATH
+
+
+          # 在远程服务器上执行部署命令
+          ssh -i ~/.ssh/private.key $SERVER_USERNAME@$SERVER_HOST "cd $DEPLOY_PATH && \
+            NODE_ENV=$NODE_ENV npm run restart:server"
+
+          # 删除本地的私钥文件
+          rm -rf ~/.ssh/private.key
+      
+      # 将执行成功的结果推送至飞书，也可以推送至其它平台或群
+      - name: Notify Feishu on success
+        if: success()
+        run: |
+          # 获取最近一次提交的 commit message
+          COMMIT_MESSAGE=$(git log -1 --pretty=format:"%s")
+
+          curl -X POST -H "Content-Type: application/json" \
+          -d '{
+            "msg_type": "text",
+            "content": {
+              "text": "部署成功！仓库：${{ github.repository }}，分支：${{ github.ref_name }}，最近一次提交信息：'"$COMMIT_MESSAGE"'"
+            }
+          }' ${{ secrets.FEISHU_ACTION_RESULT_WEBHOOK_URL }}
+
+      # 将执行失败的结果推送至飞书，也可以推送至其它平台或群
+      - name: Notify Feishu on failure
+        if: failure()
+        run: |
+          curl -X POST -H "Content-Type: application/json" \
+          -d '{
+            "msg_type": "text",
+            "content": {
+              "text": "部署失败！仓库：${{ github.repository }}，分支：${{ github.ref_name }}"
+            }
+          }' ${{ secrets.FEISHU_ACTION_RESULT_WEBHOOK_URL }}
